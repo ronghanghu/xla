@@ -282,8 +282,13 @@ class XlaFullyShardedDataParallel(nn.Module):
     if _debug_dummy_all_gather_op:
       self.all_gather_op = dummy_all_gather
     else:
-      self.all_gather_op = functools.partial(
-          xm.all_gather, pin_layout=pin_layout_in_collective_ops)
+      if pin_layout_in_collective_ops:
+        # patch all_gather when pinning layout as a workaround for https://github.com/pytorch/xla/issues/3949
+        self.all_gather_op = functools.partial(
+            _all_gather_using_all_reduce_with_ordinal, ordinal=xm.get_ordinal())
+      else:
+        self.all_gather_op = functools.partial(
+            xm.all_gather, pin_layout=pin_layout_in_collective_ops)
     if _debug_dummy_all_reduce_op:
       self.all_reduce_op = dummy_all_reduce
     else:
@@ -1539,3 +1544,31 @@ def _cast_floats_tensors(dtype: torch.dtype, *args: Any,
     return t
 
   return apply_to_tensors(fn, args), apply_to_tensors(fn, kwargs)
+
+
+def _all_gather_using_all_reduce_with_ordinal(value,
+                                              dim=0,
+                                              groups=None,
+                                              ordinal=None):
+  """
+  Similar to `xm._all_gather_using_all_reduce` but allows manually specifying ordinal
+  as a workaround for https://github.com/pytorch/xla/issues/3949.
+  """
+  if dim < 0:
+    dim = value.dim() + dim
+  size = value.size(dim)
+  padding = [0] * (2 * value.dim())
+  if ordinal is None:
+    ordinal = xm.get_ordinal()
+  if groups is None:
+    left, right = ordinal, xm.xrt_world_size() - 1 - ordinal
+  else:
+    ordinals = dict()
+    for g in groups:
+      for i, x in enumerate(g):
+        ordinals[x] = (i, len(g) - 1 - i)
+    left, right = ordinals[ordinal]
+  idx = value.dim() - 1 - dim
+  padding[2 * idx] = left * size
+  padding[2 * idx + 1] = right * size
+  return xm.all_reduce(xm.REDUCE_SUM, F.pad(value, padding), groups=groups)
